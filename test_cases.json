@@ -1,0 +1,87 @@
+{
+  "project": "Gift Genie - Trợ lý Nắm bắt Tính cách & Chọn Quà tặng Phù hợp",
+  "test_cases": [
+    {
+      "id": "TC01",
+      "ten": "Ca đơn giản - Tra cứu quà theo sở thích rõ ràng",
+      "do_kho": "simple",
+      "loai": "single-step",
+      "input": "Gợi ý cho mình 1 món quà cho bạn thân mê đọc sách, ngân sách khoảng 200.000 - 300.000 đồng.",
+      "ky_vong": {
+        "so_buoc_toi_thieu": 1,
+        "tool_can_goi": ["tim_kiem_qua_tang"],
+        "hanh_vi_dung": "Agent gọi thẳng tim_kiem_qua_tang với so_thich='đọc sách', ngan_sach_min=200000, ngan_sach_max=300000 và trả về danh sách quà phù hợp trong catalog.",
+        "tieu_chi_dat": [
+          "Không bịa tên sản phẩm ngoài catalog mock",
+          "Trả lời đúng khoảng ngân sách yêu cầu"
+        ]
+      }
+    },
+    {
+      "id": "TC02",
+      "ten": "Multi-step - Phân tích tính cách rồi mới tìm quà",
+      "do_kho": "medium",
+      "loai": "multi-step",
+      "input": "Bạn gái mình là người thích sáng tạo, hay vẽ vời, sống nội tâm, ít thích chỗ đông người. Ngân sách 500.000đ. Gợi ý quà sinh nhật giúp mình.",
+      "ky_vong": {
+        "so_buoc_toi_thieu": 3,
+        "tool_can_goi": ["phan_tich_tinh_cach", "tim_kiem_qua_tang", "kiem_tra_ton_kho"],
+        "hanh_vi_dung": "Agent phải: (1) gọi phan_tich_tinh_cach để suy ra nhóm 'Người sáng tạo/nội tâm', (2) dùng kết quả đó gọi tim_kiem_qua_tang với nhom_tinh_cach tương ứng + ngân sách, (3) gọi kiem_tra_ton_kho cho sản phẩm được chọn trước khi chốt gợi ý.",
+        "tieu_chi_dat": [
+          "Thứ tự gọi tool đúng logic phụ thuộc (không tìm quà trước khi có nhóm tính cách)",
+          "Không đề xuất sản phẩm đã hết hàng"
+        ]
+      }
+    },
+    {
+      "id": "TC03",
+      "ten": "Multi-step - Có ràng buộc văn hóa/dịp lễ",
+      "do_kho": "hard",
+      "loai": "multi-step",
+      "input": "Mình cần tặng quà Tết cho sếp người Nhật, ông ấy khá truyền thống. Ngân sách 1.000.000đ.",
+      "ky_vong": {
+        "so_buoc_toi_thieu": 3,
+        "tool_can_goi": ["tra_cuu_quy_tac_dip", "tim_kiem_qua_tang", "kiem_tra_ton_kho"],
+        "hanh_vi_dung": "Agent phải gọi tra_cuu_quy_tac_dip(dip_le='Tết', van_hoa='Nhật Bản') để lấy danh sách điều kiêng kỵ (vd tránh đồng hồ, tránh số 4) TRƯỚC khi lọc quà, sau đó loại các sản phẩm vi phạm quy tắc khỏi kết quả tim_kiem_qua_tang.",
+        "tieu_chi_dat": [
+          "Không đề xuất món quà nằm trong danh sách kiêng kỵ đã tra được",
+          "Giải thích ngắn gọn lý do loại trừ cho người dùng"
+        ]
+      }
+    },
+    {
+      "id": "TC04",
+      "ten": "Edge case - Thiếu thông tin đầu vào",
+      "do_kho": "edge",
+      "loai": "clarification",
+      "input": "Giúp mình chọn quà tặng với.",
+      "ky_vong": {
+        "so_buoc_toi_thieu": 0,
+        "tool_can_goi": [],
+        "hanh_vi_dung": "Agent KHÔNG được gọi tool ngay vì thiếu dữ liệu bắt buộc (người nhận, dịp tặng, ngân sách, sở thích/tính cách). Agent phải dừng lại và hỏi lại người dùng để làm rõ tối thiểu 1-2 tiêu chí quan trọng nhất trước khi hành động.",
+        "tieu_chi_dat": [
+          "Không tự bịa giá trị mặc định (vd tự chọn ngân sách 200k) rồi suy diễn tiếp",
+          "Câu hỏi làm rõ phải cụ thể, không hỏi chung chung 'bạn cần gì thêm không?'",
+          "Đây là ca kiểm tra Guardrail chống hallucination do thiếu input"
+        ]
+      }
+    },
+    {
+      "id": "TC05",
+      "ten": "Edge case - Ngân sách quá thấp / không có kết quả phù hợp",
+      "do_kho": "edge",
+      "loai": "no-result-fallback",
+      "input": "Tìm quà cho đồng nghiệp yêu công nghệ, ngân sách chỉ có 10.000 đồng thôi.",
+      "ky_vong": {
+        "so_buoc_toi_thieu": 1,
+        "tool_can_goi": ["tim_kiem_qua_tang"],
+        "hanh_vi_dung": "Agent gọi tim_kiem_qua_tang, tool trả về danh sách rỗng vì không có sản phẩm nào trong khoảng giá. Agent phải nhận diện Observation rỗng, KHÔNG được lặp lại gọi cùng tool nhiều lần vô ích (chống loop), và phải trả lời trung thực rằng không tìm được quà phù hợp, đồng thời đề xuất phương án (tăng ngân sách hoặc gợi ý danh mục giá thấp nhất hiện có).",
+        "tieu_chi_dat": [
+          "Không bịa sản phẩm không có trong catalog để 'chữa cháy'",
+          "Tối đa 1-2 lần gọi lại tool trước khi dừng và báo cáo cho người dùng (kiểm tra max_iterations guardrail)",
+          "Đưa ra gợi ý thay thế hợp lý (vd: mức giá thấp nhất catalog đang có là bao nhiêu)"
+        ]
+      }
+    }
+  ]
+}
