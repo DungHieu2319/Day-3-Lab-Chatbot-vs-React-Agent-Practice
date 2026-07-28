@@ -2,812 +2,612 @@
 🛠️ TOOL REGISTRY & SCHEMAS (Dành cho Role 2: Tool & Spec Engineer)
 📌 Đề tài 3: Trợ Lý Nắm Bắt Tính Cách & Chọn Quà Tặng Phù Hợp
 
-Nơi khai báo tất cả các "món đồ nghề" mà ReAct Agent có thể gọi.
-Dữ liệu tính cách được lấy từ kết quả bộ trắc nghiệm tính cách (Personality Quiz).
+Nơi khai báo tất cả các "món đồ nghề" mà ReAct Agent có thể gọi:
+  1. get_personality_profile     -> tra cứu tính cách một người (theo tên)
+  2. tra_cuu_quy_tac_dip         -> tra cứu điều nên tránh/nên tặng theo dịp lễ + văn hóa
+  3. search_gift_catalog         -> tìm quà theo sở thích + ngân sách (+ loại trừ)
+  4. suggest_gift_by_personality -> gợi ý nhanh quà theo nhóm tính cách + ngân sách
+  5. check_gift_availability     -> kiểm tra tồn kho/khuyến mãi theo mã quà
+  6. tinh_ngan_sach_gop          -> chia đều tiền quà cho nhiều người góp chung
 
-6 tool chính:
-  1. get_personality_profile    -> tra cứu kết quả trắc nghiệm tính cách
-  2. search_gift_catalog        -> tìm quà theo sở thích / ngân sách / loại trừ kiêng kỵ
-  3. check_gift_availability    -> kiểm tra tồn kho & khuyến mãi 1 sản phẩm
-  4. suggest_gift_by_personality -> gợi ý quà nhanh theo loại tính cách
-  5. tra_cuu_quy_tac_dip        -> tra lưu ý / kiêng kỵ theo dịp lễ & văn hóa
-  6. tinh_ngan_sach_gop         -> chia đều ngân sách khi nhiều người góp quà
+Nguyên tắc chung của MỌI tool trong file này: KHÔNG BAO GIỜ raise Exception ra
+ngoài — mọi lỗi (không tìm thấy, tham số sai, ngân sách âm...) đều trả về một
+chuỗi bắt đầu bằng "LỖI:" để Agent (src/app.py) đưa vào Observation và tự phục
+hồi theo Guardrails ở src/prompts.py, thay vì làm crash cả chương trình.
 """
 
-from typing import Optional
+import unicodedata
 
 
 # =============================================================================
-# 📦 MOCK DATABASE — Kết quả trắc nghiệm tính cách
+# 🧰 HÀM TIỆN ÍCH NỘI BỘ
 # =============================================================================
 
-PERSONALITY_DATABASE = {
+def _normalize(text) -> str:
+    """Chuẩn hoá chuỗi tiếng Việt để so khớp: bỏ dấu, hạ chữ thường, nối bằng "_".
+
+    Đây là bản vá cho lỗi đã ghi chú trong prompts.py: trước đây
+    get_personality_profile so khớp CHÍNH XÁC key có dấu gạch dưới không dấu
+    (vd "hoang_long"), nên input có dấu như "Hoàng Long" sẽ KHÔNG khớp. Hàm
+    này chuẩn hoá cả input người dùng lẫn key trong DB về cùng 1 dạng trước khi
+    so sánh, nên "Hoàng Long", "hoàng long", "hoang_long", "Hoang Long" đều ra
+    cùng 1 kết quả.
+    """
+    text = str(text).strip().lower()
+    text = text.replace("đ", "d")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.replace("-", " ").replace("_", " ")
+    text = "_".join(text.split())
+    return text
+
+
+def _to_number(value, field_name: str) -> float:
+    """Ép kiểu số an toàn (Action do LLM sinh ra có thể lỡ để số trong chuỗi)."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} phải là số, không phải boolean.")
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    is_thousand_separated = "," in text or text.count(".") > 1
+    if is_thousand_separated:
+        text = text.replace(",", "").replace(".", "")
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} = '{value}' không phải là số hợp lệ.")
+
+
+def _as_list(value) -> list:
+    """Cho phép tham số dạng danh sách được truyền như list hoặc 1 chuỗi đơn."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _format_vnd(amount: float) -> str:
+    return f"{amount:,.0f}".replace(",", ".") + " VNĐ"
+
+
+# =============================================================================
+# 🗄️ DỮ LIỆU GIẢ LẬP (MOCK DATABASE)
+# =============================================================================
+
+# --- Hồ sơ tính cách (mô phỏng kết quả trắc nghiệm tính cách vui) ---
+PERSONALITY_DB = {
     "minh_anh": {
-        "name": "Minh Anh",
-        "quiz_result": {
-            "personality_type": "Người Sáng Tạo (The Creator)",
-            "traits": ["sáng tạo", "giàu cảm xúc", "yêu nghệ thuật", "thích sự độc đáo"],
-            "interests": ["vẽ tranh", "nhiếp ảnh", "handmade", "thời trang vintage"],
-            "lifestyle": "Hướng nội, thích không gian yên tĩnh, hay đi quán cà phê để sáng tạo",
-            "dislike": ["đồ công nghệ phức tạp", "quà thực dụng nhàm chán"],
-            "score_summary": {
-                "sang_tao": 9,
-                "huong_ngoai": 3,
-                "thuc_dung": 4,
-                "cam_xuc": 8,
-                "phieu_luu": 5
-            }
-        }
+        "display_name": "Minh Anh",
+        "personality_type": "Người Sáng Tạo",
+        "so_thich": ["sang_tao", "sach", "am_nhac"],
+        "mo_ta": "Thích trải nghiệm mới lạ, yêu nghệ thuật và thể hiện bản thân.",
     },
     "anh_tu": {
-        "name": "Anh Tú",
-        "quiz_result": {
-            "personality_type": "Người Phiêu Lưu (The Adventurer)",
-            "traits": ["năng động", "yêu thiên nhiên", "thích khám phá", "hướng ngoại"],
-            "interests": ["camping", "leo núi", "chụp ảnh phong cảnh", "cà phê đặc sản"],
-            "lifestyle": "Hướng ngoại, cuối tuần luôn đi phượt, thích trải nghiệm mới",
-            "dislike": ["đồ trang trí để bàn", "sách lý thuyết dài"],
-            "score_summary": {
-                "sang_tao": 6,
-                "huong_ngoai": 9,
-                "thuc_dung": 7,
-                "cam_xuc": 5,
-                "phieu_luu": 10
-            }
-        }
+        "display_name": "Anh Tú",
+        "personality_type": "Người Chuyên Nghiệp",
+        "so_thich": ["van_phong_pham_cao_cap", "tra_cafe"],
+        "mo_ta": "Điềm đạm, coi trọng sự tinh tế, lịch sự và chỉn chu trong công việc.",
     },
     "hoang_long": {
-        "name": "Hoàng Long",
-        "quiz_result": {
-            "personality_type": "Người Phân Tích (The Analyst)",
-            "traits": ["logic", "tỉ mỉ", "đam mê công nghệ", "thích tối ưu hóa"],
-            "interests": ["lập trình", "đọc sách khoa học", "gaming", "gadget công nghệ"],
-            "lifestyle": "Hướng nội, thích ở nhà nghiên cứu, đam mê công nghệ mới",
-            "dislike": ["đồ handmade", "quần áo thời trang"],
-            "score_summary": {
-                "sang_tao": 7,
-                "huong_ngoai": 2,
-                "thuc_dung": 9,
-                "cam_xuc": 3,
-                "phieu_luu": 4
-            }
-        }
+        "display_name": "Hoàng Long",
+        "personality_type": "Người Phiêu Lưu",
+        "so_thich": ["outdoor", "the_thao"],
+        "mo_ta": "Năng động, thích khám phá, ưa vận động ngoài trời.",
     },
-    "thu_ha": {
-        "name": "Thu Hà",
-        "quiz_result": {
-            "personality_type": "Người Kết Nối (The Connector)",
-            "traits": ["thân thiện", "quan tâm người khác", "thích chia sẻ", "tinh tế"],
-            "interests": ["nấu ăn", "làm bánh", "chăm sóc da", "yoga", "đọc sách tâm lý"],
-            "lifestyle": "Hướng ngoại nhẹ, thích gặp gỡ bạn bè, chăm sóc bản thân và mọi người",
-            "dislike": ["đồ công nghệ khó dùng", "quà không có ý nghĩa cá nhân"],
-            "score_summary": {
-                "sang_tao": 6,
-                "huong_ngoai": 7,
-                "thuc_dung": 5,
-                "cam_xuc": 9,
-                "phieu_luu": 4
-            }
-        }
+    "lan_anh": {
+        "display_name": "Lan Anh",
+        "personality_type": "Người Điềm Tĩnh",
+        "so_thich": ["tra_cafe", "sach"],
+        "mo_ta": "Trầm tính, thích không gian yên bình, thư giãn với sách và trà.",
     },
 }
 
-# =============================================================================
-# 📦 MOCK DATABASE — Danh mục quà tặng
-# =============================================================================
-
-GIFT_CATALOG = [
-    # 🎨 Quà cho người sáng tạo / nghệ thuật
-    {"id": "GIFT_001", "name": "Bộ bút vẽ chuyên nghiệp 48 màu", "category": "nghệ thuật", "price": 350000,
-     "tags": ["vẽ tranh", "sáng tạo", "handmade", "nghệ thuật"],
-     "nhom_tinh_cach": ["sang_tao", "noi_tam"]},
-    {"id": "GIFT_002", "name": "Sổ tay da vintage khắc tên", "category": "nghệ thuật", "price": 280000,
-     "tags": ["vintage", "sáng tạo", "handmade", "viết lách"],
-     "nhom_tinh_cach": ["sang_tao", "noi_tam"]},
-    {"id": "GIFT_003", "name": "Máy ảnh chụp lấy liền Instax Mini", "category": "nhiếp ảnh", "price": 1500000,
-     "tags": ["nhiếp ảnh", "sáng tạo", "du lịch", "kỷ niệm"],
-     "nhom_tinh_cach": ["sang_tao", "huong_ngoai"]},
-
-    # 🏕️ Quà cho người phiêu lưu / outdoor
-    {"id": "GIFT_004", "name": "Bình giữ nhiệt Stanley 500ml", "category": "outdoor", "price": 450000,
-     "tags": ["camping", "du lịch", "leo núi", "thể thao", "cà phê"],
-     "nhom_tinh_cach": ["phieu_luu", "huong_ngoai"]},
-    {"id": "GIFT_005", "name": "Đèn pin cắm trại đa năng", "category": "outdoor", "price": 320000,
-     "tags": ["camping", "leo núi", "du lịch", "phiêu lưu"],
-     "nhom_tinh_cach": ["phieu_luu", "thuc_dung"]},
-    {"id": "GIFT_006", "name": "Bộ pha cà phê pour-over du lịch", "category": "outdoor", "price": 480000,
-     "tags": ["cà phê", "du lịch", "camping", "cà phê đặc sản"],
-     "nhom_tinh_cach": ["phieu_luu", "sang_tao"]},
-    {"id": "GIFT_007", "name": "Võng dù gấp gọn siêu nhẹ", "category": "outdoor", "price": 250000,
-     "tags": ["camping", "du lịch", "leo núi", "thư giãn"],
-     "nhom_tinh_cach": ["phieu_luu", "huong_ngoai"]},
-
-    # 💻 Quà cho người đam mê công nghệ
-    {"id": "GIFT_008", "name": "Bàn phím cơ mini Bluetooth", "category": "công nghệ", "price": 890000,
-     "tags": ["lập trình", "gaming", "công nghệ", "gadget"],
-     "nhom_tinh_cach": ["cong_nghe", "thuc_dung"]},
-    {"id": "GIFT_009", "name": "Đế tản nhiệt laptop RGB", "category": "công nghệ", "price": 350000,
-     "tags": ["lập trình", "gaming", "công nghệ", "gadget"],
-     "nhom_tinh_cach": ["cong_nghe", "thuc_dung"]},
-    {"id": "GIFT_010", "name": "Sách 'Clean Code' bản tiếng Việt", "category": "sách", "price": 199000,
-     "tags": ["lập trình", "đọc sách", "khoa học", "công nghệ"],
-     "nhom_tinh_cach": ["cong_nghe", "noi_tam"]},
-    {"id": "GIFT_011", "name": "Chuột không dây ergonomic", "category": "công nghệ", "price": 550000,
-     "tags": ["lập trình", "công nghệ", "gadget", "sức khỏe"],
-     "nhom_tinh_cach": ["cong_nghe", "thuc_dung"]},
-
-    # 💆 Quà cho người thích chăm sóc bản thân / kết nối
-    {"id": "GIFT_012", "name": "Set nến thơm handmade 3 mùi", "category": "chăm sóc", "price": 280000,
-     "tags": ["yoga", "thư giãn", "chăm sóc da", "handmade"],
-     "nhom_tinh_cach": ["cam_xuc", "noi_tam"]},
-    {"id": "GIFT_013", "name": "Bộ dụng cụ làm bánh cơ bản", "category": "nấu ăn", "price": 420000,
-     "tags": ["nấu ăn", "làm bánh", "sáng tạo", "chia sẻ"],
-     "nhom_tinh_cach": ["cam_xuc", "sang_tao"]},
-    {"id": "GIFT_014", "name": "Sách 'Ngôn Ngữ Tình Yêu' - Gary Chapman", "category": "sách", "price": 150000,
-     "tags": ["tâm lý", "đọc sách", "cảm xúc", "kết nối"],
-     "nhom_tinh_cach": ["cam_xuc", "noi_tam"]},
-    {"id": "GIFT_015", "name": "Set mặt nạ dưỡng da cao cấp (10 miếng)", "category": "chăm sóc", "price": 350000,
-     "tags": ["chăm sóc da", "làm đẹp", "thư giãn", "tự thưởng"],
-     "nhom_tinh_cach": ["cam_xuc", "thuc_dung"]},
-
-    # 🎁 Quà đa năng / phổ biến
-    {"id": "GIFT_016", "name": "Túi tote canvas in hình custom", "category": "thời trang", "price": 180000,
-     "tags": ["thời trang", "vintage", "handmade", "du lịch"],
-     "nhom_tinh_cach": ["sang_tao", "huong_ngoai"]},
-    {"id": "GIFT_017", "name": "Gói trải nghiệm Escape Room (2 người)", "category": "trải nghiệm", "price": 300000,
-     "tags": ["phiêu lưu", "gaming", "kết nối", "hướng ngoại"],
-     "nhom_tinh_cach": ["huong_ngoai", "phieu_luu"]},
-    {"id": "GIFT_018", "name": "Hộp chocolate thủ công Maison 12 viên", "category": "ẩm thực", "price": 390000,
-     "tags": ["ẩm thực", "chia sẻ", "cảm xúc", "kết nối"],
-     "nhom_tinh_cach": ["cam_xuc", "huong_ngoai"]},
-]
-
-# =============================================================================
-# 📦 MOCK DATABASE — Tồn kho & Khuyến mãi
-# =============================================================================
-
-INVENTORY_DATABASE = {
-    "GIFT_001": {"stock": 15, "discount": None},
-    "GIFT_002": {"stock": 8, "discount": "Giảm 15% — Mã: VINTAGE15"},
-    "GIFT_003": {"stock": 3, "discount": "Giảm 5% — Mã: INSTAX5"},
-    "GIFT_004": {"stock": 20, "discount": "Giảm 10% — Mã: OUTDOOR10"},
-    "GIFT_005": {"stock": 12, "discount": None},
-    "GIFT_006": {"stock": 0, "discount": None},  # Hết hàng!
-    "GIFT_007": {"stock": 25, "discount": "Giảm 20% — Mã: SUMMER20"},
-    "GIFT_008": {"stock": 5, "discount": None},
-    "GIFT_009": {"stock": 18, "discount": "Giảm 10% — Mã: TECH10"},
-    "GIFT_010": {"stock": 30, "discount": "Giảm 25% — Mã: BOOKWORM25"},
-    "GIFT_011": {"stock": 7, "discount": None},
-    "GIFT_012": {"stock": 10, "discount": None},
-    "GIFT_013": {"stock": 0, "discount": None},  # Hết hàng!
-    "GIFT_014": {"stock": 22, "discount": "Giảm 30% — Mã: LOVE30"},
-    "GIFT_015": {"stock": 14, "discount": "Giảm 10% — Mã: GLOW10"},
-    "GIFT_016": {"stock": 9, "discount": None},
-    "GIFT_017": {"stock": 6, "discount": "Giảm 15% — Mã: FUN15"},
-    "GIFT_018": {"stock": 11, "discount": None},
+# Ánh xạ NHÓM TÍNH CÁCH (dùng cho suggest_gift_by_personality khi chưa có hồ sơ
+# chi tiết từng người, chỉ có personality_type chung).
+PERSONALITY_TAG_MAP = {
+    "nguoi_sang_tao": ["sang_tao", "sach", "am_nhac"],
+    "nguoi_phieu_luu": ["outdoor", "the_thao"],
+    "nguoi_chuyen_nghiep": ["van_phong_pham_cao_cap", "tra_cafe"],
+    "nguoi_thuc_te": ["van_phong_pham_cao_cap", "cong_nghe"],
+    "nguoi_diem_tinh": ["tra_cafe", "sach"],
+    "nguoi_cong_nghe": ["cong_nghe", "am_nhac"],
 }
 
-# =============================================================================
-# 📦 MOCK DATABASE — Quy tắc / kiêng kỵ theo dịp lễ & văn hóa
-# =============================================================================
+# --- Danh mục quà (giá tính bằng VNĐ) ---
+GIFT_CATALOG = {
+    "GIFT_001": {
+        "ten": "Bút ký cao cấp khắc tên",
+        "gia": 350_000,
+        "tags": ["van_phong_pham_cao_cap"],
+        "ton_kho": 5,
+        "khuyen_mai": None,
+    },
+    "GIFT_002": {
+        "ten": "Bộ trà cao cấp hộp gỗ",
+        "gia": 890_000,
+        "tags": ["tra_cafe", "van_phong_pham_cao_cap"],
+        "ton_kho": 3,
+        "khuyen_mai": "Giảm 5% - Mã TRA5",
+    },
+    "GIFT_003": {
+        "ten": "Sổ tay da thủ công phong cách sáng tạo",
+        "gia": 320_000,
+        "tags": ["sang_tao"],
+        "ton_kho": 10,
+        "khuyen_mai": None,
+    },
+    "GIFT_004": {
+        "ten": "Bình giữ nhiệt Stanley 500ml",
+        "gia": 450_000,
+        "tags": ["outdoor"],
+        "ton_kho": 7,
+        "khuyen_mai": "Giảm 10% - Mã OUTDOOR10",
+    },
+    "GIFT_005": {
+        "ten": "Đồng hồ để bàn cao cấp",
+        "gia": 1_200_000,
+        # Đồng hồ bị kiêng kỵ khi tặng dịp Tết cho đối tác Nhật/Hoa (gợi liên
+        # tưởng "hết giờ" / tang lễ) -> gắn tag kieng_ky để search_gift_catalog
+        # có thể loại trừ đúng theo kết quả tra_cuu_quy_tac_dip.
+        "tags": ["van_phong_pham_cao_cap", "dong_ho"],
+        "ton_kho": 4,
+        "khuyen_mai": None,
+    },
+    "GIFT_006": {
+        "ten": "Bộ dao kéo nhà bếp inox cao cấp",
+        "gia": 680_000,
+        # Dao/kéo tượng trưng cho "cắt đứt" quan hệ -> kiêng kỵ dịp Tết.
+        "tags": ["gia_dung", "dao_keo"],
+        "ton_kho": 6,
+        "khuyen_mai": None,
+    },
+    "GIFT_007": {
+        "ten": "Tai nghe không dây chống ồn",
+        "gia": 650_000,
+        "tags": ["cong_nghe", "am_nhac"],
+        "ton_kho": 8,
+        "khuyen_mai": None,
+    },
+    "GIFT_008": {
+        "ten": "Combo sách kỹ năng bán chạy",
+        "gia": 150_000,
+        "tags": ["sach"],
+        "ton_kho": 20,
+        "khuyen_mai": None,
+    },
+    "GIFT_009": {
+        "ten": "Bộ dụng cụ cắm trại mini",
+        "gia": 780_000,
+        "tags": ["outdoor", "the_thao"],
+        "ton_kho": 4,
+        "khuyen_mai": None,
+    },
+    "GIFT_010": {
+        "ten": "Loa bluetooth mini",
+        "gia": 590_000,
+        "tags": ["am_nhac", "cong_nghe"],
+        "ton_kho": 0,
+        "khuyen_mai": None,
+    },
+}
 
-QUY_TAC_DIP_LE = {
-    ("tết", "nhật bản"): {
-        "nen_tranh": ["đồng hồ", "vật sắc nhọn (dao, kéo)", "số lượng 4 hoặc 9"],
-        "nen_uu_tien": ["trà", "văn phòng phẩm cao cấp", "đồ trang trí tinh tế"],
-        "ghi_chu": "Người Nhật coi đồng hồ tượng trưng cho thời gian cạn dần, tránh tặng cho người lớn tuổi/cấp trên."
+# --- Quy tắc kiêng kỵ / nên tặng theo DỊP LỄ, có thể lồng thêm theo VĂN HÓA ---
+OCCASION_RULES = {
+    "tet": {
+        "chung": {
+            "nen_tang": ["bánh mứt", "lì xì", "trà", "văn phòng phẩm cao cấp"],
+            "kieng_ky": ["dao_keo"],
+            "kieng_ky_ghi_chu": ["Không tặng dao/kéo (ngụ ý cắt đứt quan hệ)."],
+        },
+        "nhat_ban": {
+            "nen_tang": ["trà", "văn phòng phẩm cao cấp", "bánh kẹo đóng hộp trang nhã"],
+            "kieng_ky": ["dong_ho", "dao_keo"],
+            "kieng_ky_ghi_chu": [
+                "Không tặng đồng hồ (âm gần với 'kết thúc/tang lễ').",
+                "Không tặng dao/kéo (ngụ ý cắt đứt quan hệ).",
+                "Tránh gói quà toàn màu trắng hoặc đen thuần (liên tưởng tang lễ).",
+                "Tránh set 4 món (số 4 đọc gần âm 'tử' - cái chết).",
+            ],
+        },
+        "trung_quoc": {
+            "nen_tang": ["trà", "bánh kẹo đóng hộp trang nhã"],
+            "kieng_ky": ["dong_ho", "dao_keo"],
+            "kieng_ky_ghi_chu": [
+                "Không tặng đồng hồ (âm gần 'tống chung' - đưa đám).",
+                "Không tặng dao/kéo (ngụ ý cắt đứt quan hệ).",
+            ],
+        },
     },
-    ("tết", "việt nam"): {
-        "nen_tranh": ["vật sắc nhọn", "đồ màu đen/trắng toàn bộ"],
-        "nen_uu_tien": ["trà", "bánh mứt cao cấp", "quà mang ý nghĩa may mắn"],
-        "ghi_chu": "Tránh tặng số lượng lẻ mang ý nghĩa xui rủi tùy vùng miền."
+    "giang_sinh": {
+        "chung": {
+            "nen_tang": ["đồ ấm", "đồ trang trí", "bánh kẹo"],
+            "kieng_ky": [],
+            "kieng_ky_ghi_chu": [],
+        },
     },
-    ("sinh nhật", None): {
-        "nen_tranh": [],
-        "nen_uu_tien": ["quà cá nhân hóa theo sở thích"],
-        "ghi_chu": "Không có kiêng kỵ đặc biệt, ưu tiên cá nhân hóa theo tính cách người nhận."
-    },
-    ("valentine", None): {
-        "nen_tranh": ["quà mang tính công việc/văn phòng thuần túy"],
-        "nen_uu_tien": ["quà mang ý nghĩa tình cảm, lãng mạn"],
-        "ghi_chu": "Ưu tiên yếu tố cảm xúc hơn giá trị vật chất."
-    },
-    ("8/3", None): {
-        "nen_tranh": ["đồ gia dụng mang tính nghĩa vụ (chổi, nồi cơm...)"],
-        "nen_uu_tien": ["hoa, mỹ phẩm, set chăm sóc bản thân, voucher spa"],
-        "ghi_chu": "Ngày Quốc tế Phụ nữ — ưu tiên quà giúp người nhận thư giãn và yêu bản thân."
-    },
-    ("giáng sinh", None): {
-        "nen_tranh": [],
-        "nen_uu_tien": ["quà đóng gói đẹp, mang tính bất ngờ", "chocolate, nến thơm"],
-        "ghi_chu": "Giáng sinh chú trọng sự ấm áp và bất ngờ. Gói quà đẹp rất quan trọng."
+    "trung_thu": {
+        "chung": {
+            "nen_tang": ["bánh trung thu", "trà", "đèn lồng"],
+            "kieng_ky": [],
+            "kieng_ky_ghi_chu": [],
+        },
     },
 }
 
 
 # =============================================================================
-# 🛠️ TOOL 1: Tra cứu kết quả trắc nghiệm tính cách
+# 🛠️ 1. TRA CỨU TÍNH CÁCH
 # =============================================================================
 
 def get_personality_profile(person_name: str) -> str:
     """
-    Tra cứu kết quả trắc nghiệm tính cách của một người từ cơ sở dữ liệu.
-    Kết quả bao gồm: loại tính cách, đặc điểm, sở thích, phong cách sống,
-    điểm số các chiều tính cách, và những thứ người đó KHÔNG thích.
-
-    LUÔN gọi tool này ĐẦU TIÊN khi người dùng muốn chọn quà cho ai đó.
+    Tra cứu hồ sơ tính cách (từ trắc nghiệm tính cách vui) của một người theo tên.
 
     Args:
-        person_name (str): Tên hoặc username của người cần tra cứu.
-                           Ví dụ: 'minh_anh', 'anh_tu', 'Hoàng Long'
+        person_name (str): Tên người cần tra cứu (có dấu hoặc không dấu đều được,
+            vd 'Minh Anh', 'minh_anh', 'minh anh').
 
     Returns:
-        str: Thông tin tính cách chi tiết nếu tìm thấy.
-             Chuỗi thông báo lỗi nếu không tìm thấy người này.
-
-    Ví dụ:
-        >>> get_personality_profile("minh_anh")
-        "📋 KẾT QUẢ TRẮC NGHIỆM — Minh Anh ..."
-        >>> get_personality_profile("user_la")
-        "LỖI: Không tìm thấy kết quả trắc nghiệm ..."
+        str: Mô tả nhóm tính cách + sở thích, hoặc chuỗi "LỖI: ..." nếu không
+            tìm thấy hồ sơ.
     """
-    try:
-        # Chuẩn hóa tên: bỏ dấu cách thừa, chuyển lowercase, thay khoảng trắng bằng _
-        key = person_name.strip().lower().replace(" ", "_")
+    if not person_name or not str(person_name).strip():
+        return "LỖI: Thiếu tên người cần tra cứu tính cách (person_name trống)."
 
-        if key not in PERSONALITY_DATABASE:
-            available = ", ".join(
-                p["name"] for p in PERSONALITY_DATABASE.values()
-            )
-            return (
-                f"LỖI: Không tìm thấy kết quả trắc nghiệm cho '{person_name}'. "
-                f"Những người đã làm trắc nghiệm: {available}."
-            )
-
-        profile = PERSONALITY_DATABASE[key]
-        quiz = profile["quiz_result"]
-        scores = quiz["score_summary"]
-
-        result = (
-            f"📋 KẾT QUẢ TRẮC NGHIỆM TÍNH CÁCH — {profile['name']}\n"
-            f"🏷️ Loại tính cách: {quiz['personality_type']}\n"
-            f"✨ Đặc điểm nổi bật: {', '.join(quiz['traits'])}\n"
-            f"❤️ Sở thích: {', '.join(quiz['interests'])}\n"
-            f"🏠 Phong cách sống: {quiz['lifestyle']}\n"
-            f"🚫 Không thích: {', '.join(quiz['dislike'])}\n"
-            f"📊 Điểm tính cách (thang 1-10): "
-            f"Sáng tạo={scores['sang_tao']}, "
-            f"Hướng ngoại={scores['huong_ngoai']}, "
-            f"Thực dụng={scores['thuc_dung']}, "
-            f"Cảm xúc={scores['cam_xuc']}, "
-            f"Phiêu lưu={scores['phieu_luu']}"
+    key = _normalize(person_name)
+    profile = PERSONALITY_DB.get(key)
+    if not profile:
+        return (
+            f"LỖI: Không tìm thấy hồ sơ tính cách cho '{person_name}'. "
+            "Người này có thể chưa làm trắc nghiệm tính cách trong hệ thống."
         )
-        return result
 
-    except Exception as e:
-        return f"LỖI: Đã xảy ra lỗi khi tra cứu tính cách — {str(e)}"
+    return (
+        f"{profile['display_name']} thuộc nhóm tính cách '{profile['personality_type']}'. "
+        f"Sở thích nổi bật: {', '.join(profile['so_thich'])}. {profile['mo_ta']}"
+    )
 
 
 # =============================================================================
-# 🛠️ TOOL 2: Tìm kiếm quà tặng theo sở thích và ngân sách
+# 🛠️ 2. TRA CỨU QUY TẮC THEO DỊP LỄ / VĂN HÓA
 # =============================================================================
 
-def search_gift_catalog(
-    interests: str,
-    budget: float,
-    loai_tru: Optional[str] = None,
-) -> str:
+def tra_cuu_quy_tac_dip(dip: str, van_hoa: str = None) -> str:
     """
-    Tìm kiếm quà tặng phù hợp trong danh mục dựa trên sở thích và ngân sách.
-    Hỗ trợ loại trừ sản phẩm theo từ khóa kiêng kỵ (từ tra_cuu_quy_tac_dip).
-    Trả về danh sách quà khớp nhiều tag sở thích nhất, sắp xếp theo độ phù hợp.
-
-    Khi nào nên dùng: Sau khi đã biết sở thích/tính cách người nhận quà.
-    Khi nào KHÔNG nên dùng: Khi chưa biết sở thích → gọi get_personality_profile trước.
+    Tra cứu điều nên tặng / nên tránh khi tặng quà theo một dịp lễ, có thể lọc
+    thêm theo văn hóa/quốc gia của người nhận.
 
     Args:
-        interests (str): Các sở thích, phân cách bằng dấu phẩy.
-                         Ví dụ: 'camping, cà phê, du lịch'
-        budget (float):  Ngân sách tối đa (đơn vị VNĐ). Ví dụ: 500000
-        loai_tru (str):  Các từ khóa tên sản phẩm cần loại trừ (phân cách bằng dấu phẩy).
-                         Dùng khi có quy tắc kiêng kỵ. Ví dụ: 'đồng hồ, dao'. Mặc định None.
+        dip (str): Tên dịp lễ, vd 'Tết', 'Giáng Sinh', 'Trung Thu'.
+        van_hoa (str, optional): Văn hóa/quốc gia người nhận, vd 'Nhật Bản',
+            'Trung Quốc'. Bỏ trống để lấy quy tắc chung.
 
     Returns:
-        str: Danh sách quà phù hợp (tối đa 5 món) kèm giá và mã sản phẩm.
-             Chuỗi thông báo lỗi nếu ngân sách không hợp lệ hoặc không tìm thấy.
-
-    Ví dụ:
-        >>> search_gift_catalog("camping, cà phê", 500000)
-        "🎁 TÌM THẤY 3 MÓN QUÀ PHÙ HỢP ..."
-        >>> search_gift_catalog("du lịch", -100)
-        "LỖI: Ngân sách phải là số dương ..."
+        str: Danh sách nên tặng/nên tránh, hoặc chuỗi "LỖI: ..." nếu không có
+            dữ liệu cho dịp lễ đó.
     """
-    try:
-        # Validate ngân sách
-        budget = float(budget)
-        if budget <= 0:
-            return f"LỖI: Ngân sách phải là số dương. Bạn đã nhập: {budget} VNĐ."
+    if not dip or not str(dip).strip():
+        return "LỖI: Thiếu tên dịp lễ cần tra cứu (dip trống)."
 
-        # Tách danh sách sở thích
-        interest_list = [i.strip().lower() for i in interests.split(",") if i.strip()]
-        if not interest_list:
-            return "LỖI: Vui lòng cung cấp ít nhất 1 sở thích (phân cách bằng dấu phẩy)."
+    dip_key = _normalize(dip)
+    rules = OCCASION_RULES.get(dip_key)
+    if not rules:
+        return f"LỖI: Không có dữ liệu quy tắc kiêng kỵ cho dịp '{dip}' trong hệ thống."
 
-        # Tách danh sách loại trừ (nếu có)
-        exclude_list = []
-        if loai_tru:
-            exclude_list = [x.strip().lower() for x in loai_tru.split(",") if x.strip()]
+    van_hoa_key = _normalize(van_hoa) if van_hoa else "chung"
+    entry = rules.get(van_hoa_key)
+    note = ""
+    if not entry:
+        entry = rules["chung"]
+        if van_hoa:
+            note = f" (Chưa có dữ liệu riêng cho văn hóa '{van_hoa}', dùng quy tắc chung.)"
 
-        # Tìm quà phù hợp: lọc theo ngân sách, đếm số tag khớp
-        matched_gifts = []
-        for gift in GIFT_CATALOG:
-            if gift["price"] > budget:
-                continue
+    nen_tang = ", ".join(entry["nen_tang"]) if entry["nen_tang"] else "không có gợi ý cụ thể"
+    kieng_ky = "; ".join(entry["kieng_ky_ghi_chu"]) if entry["kieng_ky_ghi_chu"] else "không có điều đặc biệt cần tránh"
 
-            # Loại trừ theo từ khóa kiêng kỵ
-            if any(ex in gift["name"].lower() for ex in exclude_list):
-                continue
-
-            # Đếm số tag khớp với sở thích
-            match_count = 0
-            for interest in interest_list:
-                for tag in gift["tags"]:
-                    if interest in tag.lower() or tag.lower() in interest:
-                        match_count += 1
-                        break
-            if match_count > 0:
-                matched_gifts.append((match_count, gift))
-
-        # Sắp xếp theo số tag khớp (giảm dần), lấy tối đa 5 món
-        matched_gifts.sort(key=lambda x: x[0], reverse=True)
-        top_gifts = matched_gifts[:5]
-
-        if not top_gifts:
-            return (
-                f"LỖI: Không tìm thấy quà phù hợp với sở thích '{interests}' "
-                f"trong ngân sách {budget:,.0f} VNĐ. "
-                f"Hãy thử mở rộng ngân sách hoặc thay đổi từ khóa sở thích."
-            )
-
-        # Format kết quả
-        lines = [f"🎁 TÌM THẤY {len(top_gifts)} MÓN QUÀ PHÙ HỢP (ngân sách ≤ {budget:,.0f} VNĐ):"]
-        for i, (score, gift) in enumerate(top_gifts, 1):
-            lines.append(
-                f"  {i}. [{gift['id']}] {gift['name']} — "
-                f"Giá: {gift['price']:,.0f} VNĐ — "
-                f"Danh mục: {gift['category']} — "
-                f"Độ khớp: {score} tag"
-            )
-        return "\n".join(lines)
-
-    except ValueError:
-        return f"LỖI: Ngân sách '{budget}' không phải là một số hợp lệ. Vui lòng nhập số (VD: 500000)."
-    except Exception as e:
-        return f"LỖI: Đã xảy ra lỗi khi tìm quà — {str(e)}"
+    return (
+        f"Dịp '{dip}'{f' (văn hóa {van_hoa})' if van_hoa else ''}: "
+        f"Nên tặng: {nen_tang}. Nên tránh: {kieng_ky}. "
+        f"Các nhãn loại_trừ gợi ý dùng cho search_gift_catalog: {entry['kieng_ky']}.{note}"
+    )
 
 
 # =============================================================================
-# 🛠️ TOOL 3: Kiểm tra tồn kho và khuyến mãi
+# 🛠️ 3 & 4. TÌM QUÀ THEO SỞ THÍCH / THEO TÍNH CÁCH
+# =============================================================================
+
+def _search_catalog_by_tags(tags: list, budget: float, loai_tru: list) -> str:
+    tags_norm = {_normalize(t) for t in tags if str(t).strip()}
+    exclude_norm = {_normalize(t) for t in loai_tru if str(t).strip()}
+
+    candidates = []
+    for gift_id, item in GIFT_CATALOG.items():
+        item_tags = set(item["tags"])
+        if item["gia"] > budget:
+            continue
+        if exclude_norm and item_tags & exclude_norm:
+            continue
+        if tags_norm and not (item_tags & tags_norm):
+            continue
+        candidates.append((gift_id, item))
+
+    if not candidates:
+        return (
+            f"Không tìm thấy quà nào phù hợp trong ngân sách {_format_vnd(budget)} "
+            f"với sở thích {sorted(tags_norm) or 'bất kỳ'} (đã loại trừ {sorted(exclude_norm) or 'không có'})."
+        )
+
+    candidates.sort(key=lambda pair: pair[1]["gia"], reverse=True)
+    lines = [
+        f"- {gid}: {it['ten']} - {_format_vnd(it['gia'])}"
+        f"{' (còn ' + str(it['ton_kho']) + ' sp)' if it['ton_kho'] > 0 else ' (HẾT HÀNG)'}"
+        for gid, it in candidates[:3]
+    ]
+    return "Gợi ý quà phù hợp:\n" + "\n".join(lines)
+
+
+def search_gift_catalog(so_thich, budget, loai_tru=None) -> str:
+    """
+    Tìm quà trong danh mục theo danh sách sở thích cụ thể + ngân sách tối đa.
+
+    Args:
+        so_thich (list[str] | str): Một hoặc nhiều sở thích/nhãn quan tâm,
+            vd ['sang_tao', 'sach'] hoặc 'outdoor'.
+        budget (number): Ngân sách tối đa (VNĐ), phải là số dương.
+        loai_tru (list[str] | str, optional): Các nhãn cần loại trừ (vd lấy từ
+            kết quả tra_cuu_quy_tac_dip), vd ['dong_ho', 'dao_keo'].
+
+    Returns:
+        str: Danh sách tối đa 3 quà phù hợp nhất, hoặc thông báo không tìm thấy
+            / "LỖI: ..." nếu ngân sách không hợp lệ.
+    """
+    try:
+        budget_value = _to_number(budget, "budget")
+    except ValueError as e:
+        return f"LỖI: {e}"
+    if budget_value <= 0:
+        return f"LỖI: Ngân sách phải là số dương, nhận được {budget}."
+
+    return _search_catalog_by_tags(_as_list(so_thich), budget_value, _as_list(loai_tru))
+
+
+def suggest_gift_by_personality(personality_type: str, budget, loai_tru=None) -> str:
+    """
+    Gợi ý nhanh quà dựa trên NHÓM TÍNH CÁCH chung (không cần biết chi tiết sở
+    thích), phù hợp khi đã có personality_type từ get_personality_profile hoặc
+    do người dùng tự mô tả.
+
+    Args:
+        personality_type (str): Tên nhóm tính cách, vd 'Người Sáng Tạo',
+            'Người Phiêu Lưu'.
+        budget (number): Ngân sách tối đa (VNĐ), phải là số dương.
+        loai_tru (list[str] | str, optional): Các nhãn cần loại trừ (thường lấy
+            từ tra_cuu_quy_tac_dip khi câu hỏi có nhắc dịp lễ/văn hóa cụ thể).
+            QUAN TRỌNG: nếu đã tra_cuu_quy_tac_dip, LUÔN truyền loai_tru vào đây
+            — nếu không, tool này có thể gợi ý nhầm quà bị kiêng kỵ (vd đồng hồ)
+            vì bản thân nó không tự biết về quy tắc dịp lễ.
+
+    Returns:
+        str: Danh sách quà phù hợp, hoặc "LỖI: ..." nếu không nhận diện được
+            nhóm tính cách hoặc ngân sách không hợp lệ.
+    """
+    if not personality_type or not str(personality_type).strip():
+        return "LỖI: Thiếu personality_type cần gợi ý quà."
+
+    try:
+        budget_value = _to_number(budget, "budget")
+    except ValueError as e:
+        return f"LỖI: {e}"
+    if budget_value <= 0:
+        return f"LỖI: Ngân sách phải là số dương, nhận được {budget}."
+
+    key = _normalize(personality_type)
+    tags = PERSONALITY_TAG_MAP.get(key)
+    if not tags:
+        valid = ", ".join(sorted(PERSONALITY_TAG_MAP.keys()))
+        return (
+            f"LỖI: Không nhận diện được nhóm tính cách '{personality_type}'. "
+            f"Các nhóm hợp lệ: {valid}."
+        )
+
+    return _search_catalog_by_tags(tags, budget_value, _as_list(loai_tru))
+
+
+# =============================================================================
+# 🛠️ 5. KIỂM TRA TỒN KHO / KHUYẾN MÃI
 # =============================================================================
 
 def check_gift_availability(gift_id: str) -> str:
     """
-    Kiểm tra tình trạng tồn kho và mã khuyến mãi hiện có của một món quà.
-    PHẢI gọi tool này cho sản phẩm được chọn cuối cùng trước khi trả Final Answer.
+    Kiểm tra tồn kho và khuyến mãi hiện tại của một món quà theo mã.
 
     Args:
-        gift_id (str): Mã sản phẩm duy nhất. Ví dụ: 'GIFT_004'
+        gift_id (str): Mã quà, vd 'GIFT_004'.
 
     Returns:
-        str: Thông tin tồn kho (số lượng còn, mã giảm giá nếu có).
-             Chuỗi thông báo lỗi nếu mã sản phẩm không tồn tại.
-
-    Ví dụ:
-        >>> check_gift_availability("GIFT_004")
-        "📦 THÔNG TIN TỒN KHO — GIFT_004 ..."
-        >>> check_gift_availability("INVALID")
-        "LỖI: Mã sản phẩm 'INVALID' không tồn tại ..."
+        str: Thông tin tồn kho + khuyến mãi, hoặc "LỖI: ..." nếu mã không tồn tại.
     """
-    try:
-        gift_id = gift_id.strip().upper()
+    if not gift_id or not str(gift_id).strip():
+        return "LỖI: Thiếu gift_id cần kiểm tra tồn kho."
 
-        if gift_id not in INVENTORY_DATABASE:
-            valid_ids = ", ".join(sorted(INVENTORY_DATABASE.keys()))
-            return (
-                f"LỖI: Mã sản phẩm '{gift_id}' không tồn tại trong hệ thống. "
-                f"Các mã hợp lệ: {valid_ids}."
-            )
+    key = str(gift_id).strip().upper()
+    item = GIFT_CATALOG.get(key)
+    if not item:
+        return f"LỖI: Mã quà '{gift_id}' không tồn tại trong hệ thống."
 
-        inv = INVENTORY_DATABASE[gift_id]
+    if item["ton_kho"] <= 0:
+        return f"{key} - {item['ten']}: HẾT HÀNG, vui lòng chọn quà khác."
 
-        # Tìm tên sản phẩm từ catalog
-        gift_name = "Không rõ"
-        gift_price = 0
-        for g in GIFT_CATALOG:
-            if g["id"] == gift_id:
-                gift_name = g["name"]
-                gift_price = g["price"]
-                break
-
-        stock = inv["stock"]
-        discount = inv["discount"]
-
-        if stock == 0:
-            return (
-                f"📦 THÔNG TIN TỒN KHO — {gift_id}\n"
-                f"🏷️ Sản phẩm: {gift_name}\n"
-                f"💰 Giá niêm yết: {gift_price:,.0f} VNĐ\n"
-                f"❌ Trạng thái: HẾT HÀNG — Không thể mua lúc này.\n"
-                f"💡 Gợi ý: Hãy tìm món quà thay thế khác bằng search_gift_catalog."
-            )
-
-        status = "Còn hàng" if stock > 5 else f"Sắp hết (chỉ còn {stock} sản phẩm)"
-        result = (
-            f"📦 THÔNG TIN TỒN KHO — {gift_id}\n"
-            f"🏷️ Sản phẩm: {gift_name}\n"
-            f"💰 Giá niêm yết: {gift_price:,.0f} VNĐ\n"
-            f"✅ Trạng thái: {status} ({stock} sản phẩm)\n"
-        )
-        if discount:
-            result += f"🎉 Khuyến mãi: {discount}\n"
-        else:
-            result += f"🔖 Khuyến mãi: Không có khuyến mãi hiện tại.\n"
-
-        return result.strip()
-
-    except Exception as e:
-        return f"LỖI: Đã xảy ra lỗi khi kiểm tra tồn kho — {str(e)}"
+    promo = f", đang có khuyến mãi: {item['khuyen_mai']}" if item["khuyen_mai"] else ""
+    return (
+        f"{key} - {item['ten']}: còn hàng ({item['ton_kho']} sản phẩm), "
+        f"giá {_format_vnd(item['gia'])}{promo}."
+    )
 
 
 # =============================================================================
-# 🛠️ TOOL 4: Gợi ý quà theo loại tính cách
+# 🛠️ 6. CHIA NGÂN SÁCH GÓP CHUNG
 # =============================================================================
 
-def suggest_gift_by_personality(personality_type: str, budget: float) -> str:
+def tinh_ngan_sach_gop(gia_tien, so_nguoi_gop) -> str:
     """
-    Gợi ý quà tặng dựa trên loại tính cách từ kết quả trắc nghiệm.
-    Tool này ánh xạ trực tiếp loại tính cách → danh mục quà phù hợp nhất,
-    giúp Agent rút gọn bước suy luận khi đã biết personality_type.
-
-    Khi nào nên dùng: Khi đã biết loại tính cách (từ get_personality_profile)
-                      và muốn gợi ý nhanh không cần liệt kê sở thích cụ thể.
-    Khi nào KHÔNG nên dùng: Khi muốn tìm kiếm chi tiết theo từng sở thích cụ thể
-                            → dùng search_gift_catalog thay thế.
+    Chia đều số tiền một món quà cho nhiều người cùng góp mua.
 
     Args:
-        personality_type (str): Loại tính cách. Ví dụ: 'Người Sáng Tạo',
-                                'Người Phiêu Lưu', 'Người Phân Tích', 'Người Kết Nối'
-        budget (float): Ngân sách tối đa (đơn vị VNĐ). Ví dụ: 500000
+        gia_tien (number): Tổng giá tiền món quà (VNĐ), phải là số dương.
+        so_nguoi_gop (number): Số người cùng góp tiền, phải là số nguyên >= 1.
 
     Returns:
-        str: Danh sách quà gợi ý (tối đa 3 món) phù hợp loại tính cách.
-             Chuỗi thông báo lỗi nếu không nhận diện được loại tính cách.
-
-    Ví dụ:
-        >>> suggest_gift_by_personality("Người Phiêu Lưu", 500000)
-        "🎯 GỢI Ý QUÀ CHO 'Người Phiêu Lưu' ..."
+        str: Số tiền mỗi người cần góp, hoặc "LỖI: ..." nếu tham số không hợp lệ.
     """
     try:
-        budget = float(budget)
-        if budget <= 0:
-            return f"LỖI: Ngân sách phải là số dương. Bạn đã nhập: {budget} VNĐ."
+        gia_tien_value = _to_number(gia_tien, "gia_tien")
+    except ValueError as e:
+        return f"LỖI: {e}"
+    if gia_tien_value <= 0:
+        return f"LỖI: gia_tien phải là số dương, nhận được {gia_tien}."
 
-        # Ánh xạ loại tính cách → nhom_tinh_cach key trên catalog
-        ptype = personality_type.strip().lower()
-        mapping = {
-            "sáng tạo": ["sang_tao", "noi_tam"],
-            "creator": ["sang_tao", "noi_tam"],
-            "phiêu lưu": ["phieu_luu", "huong_ngoai"],
-            "adventurer": ["phieu_luu", "huong_ngoai"],
-            "phân tích": ["cong_nghe", "thuc_dung"],
-            "analyst": ["cong_nghe", "thuc_dung"],
-            "kết nối": ["cam_xuc", "huong_ngoai"],
-            "connector": ["cam_xuc", "huong_ngoai"],
-        }
-
-        # Tìm key phù hợp
-        matched_groups = None
-        for key, groups in mapping.items():
-            if key in ptype:
-                matched_groups = groups
-                break
-
-        if matched_groups is None:
-            available_types = "Người Sáng Tạo, Người Phiêu Lưu, Người Phân Tích, Người Kết Nối"
-            return (
-                f"LỖI: Không nhận diện được loại tính cách '{personality_type}'. "
-                f"Các loại hỗ trợ: {available_types}."
-            )
-
-        # Lọc quà theo nhom_tinh_cach trên catalog + ngân sách
-        matched = []
-        for gift in GIFT_CATALOG:
-            if gift["price"] > budget:
-                continue
-            score = sum(1 for g in gift.get("nhom_tinh_cach", []) if g in matched_groups)
-            if score > 0:
-                matched.append((score, gift))
-
-        matched.sort(key=lambda x: x[0], reverse=True)
-        top = matched[:3]
-
-        if not top:
-            return (
-                f"LỖI: Không tìm thấy quà cho '{personality_type}' "
-                f"trong ngân sách {budget:,.0f} VNĐ. Hãy thử tăng ngân sách."
-            )
-
-        lines = [
-            f"🎯 GỢI Ý QUÀ CHO '{personality_type}' (ngân sách ≤ {budget:,.0f} VNĐ):"
-        ]
-        for i, (score, gift) in enumerate(top, 1):
-            lines.append(
-                f"  {i}. [{gift['id']}] {gift['name']} — "
-                f"Giá: {gift['price']:,.0f} VNĐ"
-            )
-        lines.append(
-            f"💡 Dùng check_gift_availability[gift_id] để kiểm tra tồn kho trước khi chốt."
-        )
-        return "\n".join(lines)
-
-    except ValueError:
-        return f"LỖI: Ngân sách '{budget}' không phải là một số hợp lệ."
-    except Exception as e:
-        return f"LỖI: Đã xảy ra lỗi khi gợi ý quà — {str(e)}"
-
-
-# =============================================================================
-# 🛠️ TOOL 5: Tra cứu quy tắc / kiêng kỵ theo dịp lễ & văn hóa
-# =============================================================================
-
-def tra_cuu_quy_tac_dip(dip_le: str, van_hoa: Optional[str] = None) -> str:
-    """
-    Tra cứu các lưu ý / điều kiêng kỵ khi tặng quà theo dịp lễ và văn hóa cụ thể.
-    PHẢI gọi tool này TRƯỚC search_gift_catalog nếu người dùng đề cập dịp lễ
-    có yếu tố văn hóa/nghi thức (Tết, lễ truyền thống, đối tác nước ngoài...).
-
-    Args:
-        dip_le (str): Tên dịp lễ. Ví dụ: 'Tết', 'sinh nhật', 'Valentine', '8/3', 'Giáng sinh'
-        van_hoa (str): Văn hóa cụ thể (tùy chọn). Ví dụ: 'Nhật Bản', 'Việt Nam'.
-                       Để None nếu không rõ hoặc quy tắc chung.
-
-    Returns:
-        str: Các điều nên tránh, nên ưu tiên, và ghi chú quan trọng.
-             Chuỗi thông báo nếu không tìm thấy dữ liệu cho dịp lễ này.
-
-    Ví dụ:
-        >>> tra_cuu_quy_tac_dip("Tết", "Nhật Bản")
-        "📜 QUY TẮC TẶNG QUÀ — Dịp: Tết | Văn hóa: Nhật Bản ..."
-        >>> tra_cuu_quy_tac_dip("sinh nhật")
-        "📜 QUY TẮC TẶNG QUÀ — Dịp: sinh nhật ..."
-    """
     try:
-        key_dip = dip_le.strip().lower()
-        key_vh = van_hoa.strip().lower() if van_hoa else None
+        so_nguoi_value = _to_number(so_nguoi_gop, "so_nguoi_gop")
+    except ValueError as e:
+        return f"LỖI: {e}"
+    if so_nguoi_value < 1 or int(so_nguoi_value) != so_nguoi_value:
+        return f"LỖI: so_nguoi_gop phải là số nguyên >= 1, nhận được {so_nguoi_gop}."
 
-        # Ưu tiên khớp đúng cả dịp lễ + văn hóa, sau đó fallback về dịp lễ chung
-        quy_tac = None
-        for (d, v), qt in QUY_TAC_DIP_LE.items():
-            if d == key_dip and v == key_vh:
-                quy_tac = qt
-                break
-
-        if quy_tac is None:
-            for (d, v), qt in QUY_TAC_DIP_LE.items():
-                if d == key_dip and v is None:
-                    quy_tac = qt
-                    break
-
-        if quy_tac is None:
-            vh_text = f" / văn hóa '{van_hoa}'" if van_hoa else ""
-            return (
-                f"LỖI: Chưa có dữ liệu quy tắc cho dịp '{dip_le}'{vh_text}. "
-                f"Các dịp có sẵn: Tết (Việt Nam, Nhật Bản), Sinh nhật, Valentine, 8/3, Giáng sinh."
-            )
-
-        vh_display = f" | Văn hóa: {van_hoa}" if van_hoa else ""
-        tranh = ", ".join(quy_tac["nen_tranh"]) if quy_tac["nen_tranh"] else "Không có kiêng kỵ đặc biệt"
-        uu_tien = ", ".join(quy_tac["nen_uu_tien"])
-
-        result = (
-            f"📜 QUY TẮC TẶNG QUÀ — Dịp: {dip_le}{vh_display}\n"
-            f"🚫 Nên tránh: {tranh}\n"
-            f"✅ Nên ưu tiên: {uu_tien}\n"
-            f"📝 Ghi chú: {quy_tac['ghi_chu']}"
-        )
-        return result
-
-    except Exception as e:
-        return f"LỖI: Đã xảy ra lỗi khi tra cứu quy tắc dịp lễ — {str(e)}"
+    per_person = gia_tien_value / so_nguoi_value
+    return (
+        f"Tổng {_format_vnd(gia_tien_value)} chia đều cho {int(so_nguoi_value)} người "
+        f"= mỗi người góp {_format_vnd(per_person)}."
+    )
 
 
 # =============================================================================
-# 🛠️ TOOL 6: Tính ngân sách góp (chia đều khi nhiều người góp quà)
-# =============================================================================
-
-def tinh_ngan_sach_gop(tong_tien: int, so_nguoi_gop: int) -> str:
-    """
-    Chia đều ngân sách khi nhiều người cùng góp mua một món quà.
-    Giúp nhóm bạn bè / đồng nghiệp biết mỗi người cần góp bao nhiêu.
-
-    Args:
-        tong_tien (int): Tổng ngân sách dự kiến hoặc giá sản phẩm (đơn vị VNĐ). Ví dụ: 900000
-        so_nguoi_gop (int): Số người tham gia góp quà. Ví dụ: 4
-
-    Returns:
-        str: Thông tin phân chia ngân sách (tổng tiền, số người, mỗi người góp).
-             Chuỗi thông báo lỗi nếu tham số không hợp lệ.
-
-    Ví dụ:
-        >>> tinh_ngan_sach_gop(900000, 4)
-        "💰 PHÂN CHIA NGÂN SÁCH GÓP QUÀ ..."
-        >>> tinh_ngan_sach_gop(500000, 0)
-        "LỖI: Số người góp phải lớn hơn 0."
-    """
-    try:
-        tong_tien = int(tong_tien)
-        so_nguoi_gop = int(so_nguoi_gop)
-
-        if so_nguoi_gop <= 0:
-            return "LỖI: Số người góp phải lớn hơn 0."
-        if tong_tien <= 0:
-            return "LỖI: Tổng tiền phải là số dương."
-
-        moi_nguoi = round(tong_tien / so_nguoi_gop)
-        result = (
-            f"💰 PHÂN CHIA NGÂN SÁCH GÓP QUÀ\n"
-            f"💵 Tổng tiền: {tong_tien:,.0f} VNĐ\n"
-            f"👥 Số người góp: {so_nguoi_gop}\n"
-            f"🧮 Mỗi người góp: {moi_nguoi:,.0f} VNĐ"
-        )
-        return result
-
-    except ValueError:
-        return f"LỖI: Tham số không hợp lệ. tong_tien và so_nguoi_gop phải là số nguyên."
-    except Exception as e:
-        return f"LỖI: Đã xảy ra lỗi khi tính ngân sách — {str(e)}"
-
-
-# =============================================================================
-# 📋 ĐĂNG KÝ DANH SÁCH TOOLS CHO AGENT
-# =============================================================================
-
-AVAILABLE_TOOLS = {
-    "get_personality_profile": get_personality_profile,
-    "search_gift_catalog": search_gift_catalog,
-    "check_gift_availability": check_gift_availability,
-    "suggest_gift_by_personality": suggest_gift_by_personality,
-    "tra_cuu_quy_tac_dip": tra_cuu_quy_tac_dip,
-    "tinh_ngan_sach_gop": tinh_ngan_sach_gop,
-}
-
-
-# =============================================================================
-# 📋 TOOL SPECS — Schema chuẩn cho LLM function-calling
+# 📋 TOOL SPECS (dùng để lắp REACT_SYSTEM_PROMPT trong src/prompts.py)
 # =============================================================================
 
 TOOL_SPECS = [
     {
         "name": "get_personality_profile",
-        "description": (
-            "Tra cứu kết quả trắc nghiệm tính cách của một người (loại tính cách, sở thích, "
-            "đặc điểm, phong cách sống, điểm số các chiều tính cách). "
-            "LUÔN gọi tool này ĐẦU TIÊN khi người dùng muốn chọn quà cho ai đó."
-        ),
+        "description": "Tra cứu hồ sơ tính cách (nhóm tính cách + sở thích) của một người theo tên.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "person_name": {
                     "type": "string",
-                    "description": "Tên hoặc username người cần tra cứu. VD: 'minh_anh', 'Anh Tú'."
-                }
+                    "description": "Tên người cần tra cứu, vd 'Minh Anh'.",
+                },
             },
             "required": ["person_name"],
         },
     },
     {
-        "name": "search_gift_catalog",
-        "description": (
-            "Tìm kiếm quà tặng theo sở thích và ngân sách. Hỗ trợ loại trừ sản phẩm kiêng kỵ. "
-            "Trả về danh sách rỗng nếu không có sản phẩm phù hợp — KHÔNG được tự bịa sản phẩm."
-        ),
+        "name": "tra_cuu_quy_tac_dip",
+        "description": "Tra cứu điều nên tặng/nên tránh khi tặng quà theo một dịp lễ, có thể lọc theo văn hóa người nhận.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "interests": {
+                "dip": {
                     "type": "string",
-                    "description": "Các sở thích phân cách bằng dấu phẩy. VD: 'camping, cà phê'."
+                    "description": "Tên dịp lễ, vd 'Tết', 'Giáng Sinh'.",
                 },
-                "budget": {
-                    "type": "number",
-                    "description": "Ngân sách tối đa (VNĐ). VD: 500000."
-                },
-                "loai_tru": {
+                "van_hoa": {
                     "type": "string",
-                    "description": "Từ khóa tên sản phẩm cần loại trừ (phân cách bằng dấu phẩy). Dùng khi có quy tắc kiêng kỵ."
+                    "description": "Văn hóa/quốc gia người nhận, vd 'Nhật Bản'. Bỏ trống nếu không rõ.",
                 },
             },
-            "required": ["interests", "budget"],
+            "required": ["dip"],
         },
     },
     {
-        "name": "check_gift_availability",
-        "description": (
-            "Kiểm tra tồn kho và khuyến mãi của một sản phẩm cụ thể (theo mã sản phẩm). "
-            "PHẢI gọi tool này cho sản phẩm được chọn cuối cùng trước khi trả Final Answer."
-        ),
+        "name": "search_gift_catalog",
+        "description": "Tìm quà trong danh mục theo danh sách sở thích cụ thể + ngân sách tối đa, có thể loại trừ một số nhãn kiêng kỵ.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "gift_id": {
-                    "type": "string",
-                    "description": "Mã sản phẩm. VD: 'GIFT_004'."
-                }
+                "so_thich": {
+                    "type": "array",
+                    "description": "Danh sách sở thích/nhãn quan tâm, vd ['sang_tao', 'sach'].",
+                },
+                "budget": {
+                    "type": "number",
+                    "description": "Ngân sách tối đa (VNĐ), phải là số dương.",
+                },
+                "loai_tru": {
+                    "type": "array",
+                    "description": "Danh sách nhãn cần loại trừ (thường lấy từ tra_cuu_quy_tac_dip).",
+                },
             },
-            "required": ["gift_id"],
+            "required": ["so_thich", "budget"],
         },
     },
     {
         "name": "suggest_gift_by_personality",
-        "description": (
-            "Gợi ý quà nhanh dựa trên loại tính cách (từ kết quả trắc nghiệm). "
-            "Dùng khi muốn gợi ý nhanh mà không cần liệt kê từng sở thích cụ thể."
-        ),
+        "description": "Gợi ý nhanh quà theo nhóm tính cách chung + ngân sách, dùng khi chỉ có personality_type mà chưa có danh sách sở thích cụ thể. Nếu trước đó đã gọi tra_cuu_quy_tac_dip, PHẢI truyền kết quả loại trừ vào loai_tru để không gợi ý nhầm quà kiêng kỵ.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "personality_type": {
                     "type": "string",
-                    "description": "Loại tính cách. VD: 'Người Sáng Tạo', 'Người Phiêu Lưu'."
+                    "description": "Tên nhóm tính cách, vd 'Người Sáng Tạo'.",
                 },
                 "budget": {
                     "type": "number",
-                    "description": "Ngân sách tối đa (VNĐ). VD: 500000."
+                    "description": "Ngân sách tối đa (VNĐ), phải là số dương.",
+                },
+                "loai_tru": {
+                    "type": "array",
+                    "description": "Danh sách nhãn cần loại trừ (thường lấy từ tra_cuu_quy_tac_dip).",
                 },
             },
             "required": ["personality_type", "budget"],
         },
     },
     {
-        "name": "tra_cuu_quy_tac_dip",
-        "description": (
-            "Tra cứu điều nên tránh / nên ưu tiên khi tặng quà theo dịp lễ và văn hóa cụ thể. "
-            "PHẢI gọi TRƯỚC search_gift_catalog khi người dùng đề cập dịp lễ có yếu tố văn hóa."
-        ),
+        "name": "check_gift_availability",
+        "description": "Kiểm tra tồn kho và khuyến mãi hiện tại của một món quà theo mã quà.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "dip_le": {
+                "gift_id": {
                     "type": "string",
-                    "description": "Tên dịp lễ. VD: 'Tết', 'sinh nhật', 'Valentine', '8/3'."
-                },
-                "van_hoa": {
-                    "type": "string",
-                    "description": "Văn hóa cụ thể (tùy chọn). VD: 'Nhật Bản', 'Việt Nam'."
+                    "description": "Mã quà cần kiểm tra, vd 'GIFT_004'.",
                 },
             },
-            "required": ["dip_le"],
+            "required": ["gift_id"],
         },
     },
     {
         "name": "tinh_ngan_sach_gop",
-        "description": "Chia đều ngân sách khi nhiều người cùng góp mua một món quà.",
+        "description": "Chia đều số tiền một món quà cho nhiều người cùng góp mua.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "tong_tien": {
-                    "type": "integer",
-                    "description": "Tổng ngân sách dự kiến (VNĐ). VD: 900000."
+                "gia_tien": {
+                    "type": "number",
+                    "description": "Tổng giá tiền món quà (VNĐ), phải là số dương.",
                 },
                 "so_nguoi_gop": {
-                    "type": "integer",
-                    "description": "Số người tham gia góp quà. VD: 4."
+                    "type": "number",
+                    "description": "Số người cùng góp tiền, số nguyên >= 1.",
                 },
             },
-            "required": ["tong_tien", "so_nguoi_gop"],
+            "required": ["gia_tien", "so_nguoi_gop"],
         },
     },
 ]
+
+
+# Danh sách các tool được đăng ký để Agent sử dụng
+AVAILABLE_TOOLS = {
+    "get_personality_profile": get_personality_profile,
+    "tra_cuu_quy_tac_dip": tra_cuu_quy_tac_dip,
+    "search_gift_catalog": search_gift_catalog,
+    "suggest_gift_by_personality": suggest_gift_by_personality,
+    "check_gift_availability": check_gift_availability,
+    "tinh_ngan_sach_gop": tinh_ngan_sach_gop,
+}
 
 
 # =============================================================================
@@ -816,59 +616,50 @@ TOOL_SPECS = [
 
 if __name__ == "__main__":
     import sys
-    if sys.stdout.encoding != 'utf-8':
+    if sys.stdout.encoding != "utf-8":
         try:
-            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
     print("=" * 60)
-    print("🧪 SELF-TEST: Tools cho Trợ Lý Chọn Quà Tặng")
+    print("🧪 SELF-TEST: tools.py")
     print("=" * 60)
 
-    print("\n== Test 1: get_personality_profile ==")
-    print(get_personality_profile("anh_tu"))
+    print("\n[1] get_personality_profile('Minh Anh') (có dấu, có khoảng trắng):")
+    print(get_personality_profile("Minh Anh"))
 
-    print("\n== Test 2: get_personality_profile (edge case) ==")
-    print(get_personality_profile("user_khong_ton_tai"))
+    print("\n[2] get_personality_profile('Người Vô Hình') (không tồn tại):")
+    print(get_personality_profile("Người Vô Hình"))
 
-    print("\n== Test 3: search_gift_catalog ==")
-    print(search_gift_catalog("camping, cà phê", 500000))
-
-    print("\n== Test 4: search_gift_catalog (với loại trừ) ==")
-    print(search_gift_catalog("camping, cà phê", 500000, loai_tru="bình giữ nhiệt"))
-
-    print("\n== Test 5: search_gift_catalog (edge case: ngân sách âm) ==")
-    print(search_gift_catalog("du lịch", -100))
-
-    print("\n== Test 6: check_gift_availability (còn hàng + khuyến mãi) ==")
-    print(check_gift_availability("GIFT_004"))
-
-    print("\n== Test 7: check_gift_availability (hết hàng) ==")
-    print(check_gift_availability("GIFT_006"))
-
-    print("\n== Test 8: check_gift_availability (edge case: mã sai) ==")
-    print(check_gift_availability("INVALID"))
-
-    print("\n== Test 9: suggest_gift_by_personality ==")
-    print(suggest_gift_by_personality("Người Phiêu Lưu", 500000))
-
-    print("\n== Test 10: tra_cuu_quy_tac_dip (Tết - Nhật Bản) ==")
+    print("\n[3] tra_cuu_quy_tac_dip('Tết', 'Nhật Bản'):")
     print(tra_cuu_quy_tac_dip("Tết", "Nhật Bản"))
 
-    print("\n== Test 11: tra_cuu_quy_tac_dip (sinh nhật) ==")
-    print(tra_cuu_quy_tac_dip("sinh nhật"))
-
-    print("\n== Test 12: tra_cuu_quy_tac_dip (edge case: dịp lạ) ==")
+    print("\n[4] tra_cuu_quy_tac_dip('Halloween') (không có dữ liệu):")
     print(tra_cuu_quy_tac_dip("Halloween"))
 
-    print("\n== Test 13: tinh_ngan_sach_gop ==")
-    print(tinh_ngan_sach_gop(900000, 4))
+    print("\n[5] search_gift_catalog(['sang_tao'], 400000):")
+    print(search_gift_catalog(["sang_tao"], 400000))
 
-    print("\n== Test 14: tinh_ngan_sach_gop (edge case: 0 người) ==")
-    print(tinh_ngan_sach_gop(500000, 0))
+    print("\n[6] search_gift_catalog(['van_phong_pham_cao_cap'], 1500000, ['dong_ho', 'dao_keo']):")
+    print(search_gift_catalog(["van_phong_pham_cao_cap", "tra_cafe"], 1500000, ["dong_ho", "dao_keo"]))
+
+    print("\n[7] search_gift_catalog([], -500) (ngân sách âm - bẫy guardrail):")
+    print(search_gift_catalog([], -500))
+
+    print("\n[8] check_gift_availability('GIFT_004'):")
+    print(check_gift_availability("GIFT_004"))
+
+    print("\n[9] check_gift_availability('GIFT_999') (mã không tồn tại - bẫy guardrail):")
+    print(check_gift_availability("GIFT_999"))
+
+    print("\n[10] tinh_ngan_sach_gop(890000, 4):")
+    print(tinh_ngan_sach_gop(890000, 4))
+
+    print(f"\n✅ TOOL_SPECS có {len(TOOL_SPECS)} tool, AVAILABLE_TOOLS có {len(AVAILABLE_TOOLS)} tool.")
+    assert len(TOOL_SPECS) == len(AVAILABLE_TOOLS)
+    assert {spec['name'] for spec in TOOL_SPECS} == set(AVAILABLE_TOOLS.keys())
 
     print("\n" + "=" * 60)
-    print(f"✅ Tổng cộng {len(AVAILABLE_TOOLS)} tools đã đăng ký: {list(AVAILABLE_TOOLS.keys())}")
-    print(f"✅ Tổng cộng {len(TOOL_SPECS)} tool specs đã khai báo.")
+    print("✅ Tất cả self-test PASS.")
     print("=" * 60)
