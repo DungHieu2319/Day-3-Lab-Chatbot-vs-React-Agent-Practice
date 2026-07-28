@@ -1,0 +1,41 @@
+```mermaid
+flowchart TD
+    Start["🧑 Người dùng đặt câu hỏi"]
+    Classify{"🔍 Phân loại câu hỏi"}
+    
+    Start --> Classify
+    
+    Classify -->|"Câu hỏi lý thuyết / kiến thức chung<br/>(VD: Quà phổ biến cho nam 25-30?)"| ChatbotPath
+    Classify -->|"Câu hỏi cần dữ liệu cá nhân hóa<br/>(VD: Bạn tôi hướng nội, thích trà...)"| AgentPath
+    
+    subgraph ChatbotPath["🤖 CHATBOT PATH (Cấp 2)"]
+        C1["📨 Gửi prompt cho LLM"]
+        C2["💬 LLM sinh câu trả lời<br/>(1 lần gọi duy nhất)"]
+        C3["✅ Trả kết quả cho người dùng"]
+        C1 --> C2 --> C3
+    end
+    
+    subgraph AgentPath["🧠 REACT AGENT PATH (Cấp 3)"]
+        A1["🧠 Thought: Cần phân tích tính cách"]
+        A2["🛠️ Action: analyze_personality"]
+        A3["👁️ Observation: Kết quả phân tích"]
+        A4{"❓ Cần thêm thông tin?"}
+        A5["🛠️ Action: search_gift_products"]
+        A6["👁️ Observation: Danh sách sản phẩm"]
+        A7["🏁 Final Answer: Gợi ý quà cá nhân hóa"]
+        
+        A1 --> A2 --> A3 --> A4
+        A4 -->|"Có (cần tìm sản phẩm cụ thể)"| A5 --> A6 --> A7
+        A4 -->|"Không (đã đủ thông tin)"| A7
+    end
+    
+    subgraph Guardrail["🛡️ GUARDRAIL"]
+        G1{"⚠️ Step ≥ MAX_ITERATIONS?"}
+        G2["🚫 Ngắt lặp an toàn"]
+        G3["📢 Trả thông báo lịch sự"]
+        G1 -->|"Có"| G2 --> G3
+    end
+    
+    AgentPath -.->|"Mỗi bước kiểm tra"| G1
+    G1 -->|"Không"| AgentPath
+```
