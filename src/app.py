@@ -19,7 +19,7 @@ if sys.stdout.encoding != 'utf-8':
         pass
 
 # Import các thành phần từ file của Role 2, Role 3 & Multi-Provider Adapter
-from tools import AVAILABLE_TOOLS, get_weather, search_flights
+from tools import AVAILABLE_TOOLS, get_personality_profile, search_gift_catalog, check_gift_availability
 from prompts import CHATBOT_BASELINE_PROMPT, REACT_SYSTEM_PROMPT, MAX_ITERATIONS
 from providers import get_llm_provider
 
@@ -62,16 +62,25 @@ def run_react_agent(user_query: str, provider):
         print(f"\n--- 🔄 Vòng lặp ReAct (Step {step}/{MAX_ITERATIONS}) ---")
         
         if step == 1:
-            print("🧠 Thought: Câu hỏi này cần tra cứu thời tiết thời gian thực.")
-            print("🛠️ Action: get_weather['Hà Nội']")
+            print("🧠 Thought: Cần tra cứu kết quả trắc nghiệm tính cách của Anh Tú.")
+            print("🛠️ Action: get_personality_profile['Anh Tú']")
             
             # Thực thi tool
-            obs = get_weather("Hà Nội")
-            print(f"👁️ Observation: {obs}")
+            obs = get_personality_profile("Anh Tú")
+            print(f"👁️ Observation:\n{obs}")
             
         elif step == 2:
-            print("🧠 Thought: Tôi đã có thông tin thời tiết Hà Nội, giờ tôi có thể tư vấn trang phục.")
-            print("🏁 Final Answer: Thời tiết Hà Nội hôm nay 28°C, nắng nhẹ. Bạn nên mặc áo phông thoáng mát!")
+            print("\n🧠 Thought: Anh Tú có sở thích camping và cà phê đặc sản, ngân sách 500k. Cần tìm quà trong catalog.")
+            print("🛠️ Action: search_gift_catalog['camping, cà phê', 500000]")
+            obs2 = search_gift_catalog("camping, cà phê", 500000)
+            print(f"👁️ Observation:\n{obs2}")
+
+        elif step == 3:
+            print("\n🧠 Thought: Đã tìm thấy món quà phù hợp 'Bình giữ nhiệt Stanley 500ml' (GIFT_004). Kiểm tra tồn kho.")
+            print("🛠️ Action: check_gift_availability['GIFT_004']")
+            obs3 = check_gift_availability("GIFT_004")
+            print(f"👁️ Observation:\n{obs3}")
+            print("\n🏁 Final Answer: Gợi ý tặng Anh Tú 'Bình giữ nhiệt Stanley 500ml' (450,000 VNĐ, đang có mã giảm 10% OUTDOOR10). Quà cực kỳ phù hợp với sở thích phượt camping và uống cà phê của Anh Tú!")
             break
             
     if step >= MAX_ITERATIONS:

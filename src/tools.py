@@ -252,10 +252,18 @@ def get_personality_profile(person_name: str) -> str:
         "LỖI: Không tìm thấy kết quả trắc nghiệm ..."
     """
     try:
-        # Chuẩn hóa tên: bỏ dấu cách thừa, chuyển lowercase, thay khoảng trắng bằng _
-        key = person_name.strip().lower().replace(" ", "_")
+        # Chuẩn hóa tên để tìm kiếm linh hoạt (khớp key hoặc khớp name)
+        raw_input = person_name.strip().lower()
+        key_input = raw_input.replace(" ", "_")
 
-        if key not in PERSONALITY_DATABASE:
+        matched_key = None
+        for k, p in PERSONALITY_DATABASE.items():
+            name_lower = p["name"].lower()
+            if k == key_input or name_lower == raw_input or k in key_input or key_input in k:
+                matched_key = k
+                break
+
+        if not matched_key:
             available = ", ".join(
                 p["name"] for p in PERSONALITY_DATABASE.values()
             )
@@ -264,7 +272,7 @@ def get_personality_profile(person_name: str) -> str:
                 f"Những người đã làm trắc nghiệm: {available}."
             )
 
-        profile = PERSONALITY_DATABASE[key]
+        profile = PERSONALITY_DATABASE[matched_key]
         quiz = profile["quiz_result"]
         scores = quiz["score_summary"]
 
